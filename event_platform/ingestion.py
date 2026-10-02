@@ -3,6 +3,9 @@
 不变量：
 - 事件先按声明的原版本验证（不是当前可见版本），过渡期内旧版本仍可写；
 - 无效事件进入隔离区，事件库与所有消费者投影都不留痕迹；
+- 投影按消费者固定的 {字段 ID: 类型} 解析：事件版本里有的值直接取值；
+  事件版本缺失但可见版本为可选字段的槽位，用可见版本默认值补齐
+  （无默认值则为 None）；必需字段无法补齐说明绕过了闸门，隔离该事件；
 - 投影先为全部活跃消费者构建完毕，再与入库在同一临界区内一次提交，
   任何中途失败都不会留下部分投影。
 """
@@ -13,7 +16,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from .consumers import ConsumerManager
-from .model import SchemaVersion
+from .model import FieldType, SchemaVersion
 from .registry import SchemaRegistry
 
 
@@ -60,8 +63,52 @@ class IngestResult:
         return f"IngestResult({self.status.value}, {self.event_id!r}, {self.reason!r})"
 
 
+def resolve_projection_view(
+    sv: SchemaVersion,
+    requirements: Dict[int, FieldType],
+    normalized: Dict[int, Any],
+    visible: SchemaVersion,
+) -> Dict[int, Any]:
+    """为一个消费者解析投影，保证投影值与它固定的类型不矛盾。
+
+    事件按声明版本 ``sv`` 验证，``normalized`` 里只有该版本认识的值/默认值；
+    消费者可能已升级去读更新版本（``visible``）才有的字段。对每个固定字段：
+
+    1. 事件声明版本里就有 -> 直接取值（注册/发布/升级三重闸门保证类型已相符）；
+    2. 事件声明版本里没有：
+       - 可见版本提供非空默认值 -> 用默认值补齐（可选字段跨版本默认值）；
+       - 可见版本中该字段为无默认值的可选字段 -> 投影 None（允许缺席）；
+       - 可见版本中为必需字段 -> 不可能到达：闸门会拒绝这种注册/发布，
+         此处作为防御性兜底抛出 TypeError 以触发隔离，绝不入库一个矛盾投影。
+    """
+    data: Dict[int, Any] = build_projection(requirements, normalized)
+    for fid, pinned in requirements.items():
+        if fid in normalized:
+            value = data[fid]
+            if value is not None and not pinned.accepts(value):
+                raise TypeError(
+                    f"字段 {fid} 的值 {value!r} 与消费者固定类型 {pinned.value} 不兼容"
+                )
+            continue
+        visible_field = visible.fields.get(fid)
+        if visible_field is not None and visible_field.default is not None:
+            data[fid] = visible_field.default
+        elif visible_field is not None and not visible_field.required:
+            data[fid] = None
+        else:
+            # 不应发生（见闸门）；抛出后由接入临界区隔离该事件
+            raise TypeError(
+                f"字段 {fid} 在事件声明版本 v{sv.version} 中缺失，"
+                f"且可见版本 v{visible.version} 中无默认值可补齐"
+            )
+    return data
+
+
 def build_projection(requirements: Dict[int, Any], normalized: Dict[int, Any]) -> Dict[int, Any]:
-    """按消费者固定的字段 ID 抽取投影（以 ID 为键，重命名透明）。"""
+    """按消费者固定的字段 ID 抽取投影（以 ID 为键，重命名透明）。
+
+    保留供单版本场景直接使用；跨版本投影请用 :func:`resolve_projection_view`。
+    """
     return {fid: normalized.get(fid) for fid in requirements}
 
 
@@ -133,10 +180,14 @@ class IngestionEngine:
                     event_id, producer_id, schema_version, payload, "；".join(errors)
                 )
 
-            # 先为全部活跃消费者构建投影，全部成功后才提交 —— 不留部分投影
+            # 先为全部活跃消费者构建投影，全部成功后才提交 —— 不留部分投影。
+            # 可见版本用于把旧版事件缺失、但新版可选字段带默认值的槽位补齐。
+            visible = self._registry.current()
             try:
                 projections = {
-                    view.consumer_id: build_projection(view.requirements, normalized)
+                    view.consumer_id: resolve_projection_view(
+                        sv, view.requirements, normalized, visible
+                    )
                     for view in self._consumers.active_views()
                 }
             except Exception as exc:

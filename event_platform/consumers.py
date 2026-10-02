@@ -1,6 +1,8 @@
 """消费者投影模块：消费者固定所需字段 ID 与类型，按各自视图读取事件。
 
-- 注册/升级时，消费者固定的 {字段 ID: 类型} 会与当前可见版本核对；
+- 注册/升级时，消费者固定的 {字段 ID: 类型} 会与**所有仍接受写入的版本**核对
+  （不只可见版本）：过渡期内任何旧版有效事件都必须能投影出类型相符的值，
+  否则升级本身就会制造"接入成功、投影空值"的矛盾，必须在升级处拒绝；
 - 投影以字段 ID 为键 —— 显示名称重命名对消费者完全透明；
 - 投影日志按事件逐条追加，由接入模块在验证通过后一次性提交。
 """
@@ -8,10 +10,10 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from .model import FieldType, SchemaError
-from .registry import SchemaRegistry
+from .model import CompatibilityError, FieldType, SchemaError
+from .registry import ConsumerRequirements, SchemaRegistry, find_transition_problems
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,14 @@ class ProjectedEvent:
     event_id: str
     schema_version: int  # 事件写入时声明并验证的版本
     data: Dict[int, Any]  # 以字段 ID 为键的投影数据
+
+
+@dataclass(frozen=True)
+class _PlainRequirements:
+    """把一组待注册的 {字段 ID: 类型} 包装成注册中心检查所需的消费者形状。"""
+
+    consumer_id: str
+    requirements: Dict[int, FieldType]
 
 
 class Consumer:
@@ -46,24 +56,29 @@ class ConsumerManager:
             raise SchemaError(f"消费者 {consumer_id!r} 不存在") from None
 
     def _validate_requirements(self, requirements: Dict[int, FieldType]) -> None:
-        """固定的字段与类型必须能对上当前可见版本。"""
+        """固定的字段与类型必须在整个过渡期内都可满足。
+
+        不只核对当前可见版本：注册/升级后，任何仍接受写入的旧版本事件都可能到达，
+        它们投影到该消费者时也必须与其固定类型相符（缺字段时要么能由可见版本的
+        默认值补齐，要么消费者固定的本就是允许缺席的可选字段）。否则升级动作本身
+        就会制造"接入成功但投影空值"的矛盾，必须在此拒绝。
+        """
         if not requirements:
             raise SchemaError("消费者至少需要固定一个字段")
+        illegal = [
+            f"字段 {fid} 固定的类型非法: {pinned!r}"
+            for fid, pinned in requirements.items()
+            if not isinstance(pinned, FieldType)
+        ]
+        if illegal:
+            raise SchemaError("；".join(illegal))
         current = self._registry.current()
-        problems = []
-        for fid, pinned in requirements.items():
-            if not isinstance(pinned, FieldType):
-                problems.append(f"字段 {fid} 固定的类型非法: {pinned!r}")
-                continue
-            f = current.fields.get(fid)
-            if f is None:
-                problems.append(f"字段 {fid} 在当前版本 v{current.version} 中不存在")
-            elif f.type is not pinned:
-                problems.append(
-                    f"字段 {fid} 固定类型 {pinned.value} 与当前类型 {f.type.value} 不符"
-                )
+        view: ConsumerRequirements = _PlainRequirements("(new)", requirements)
+        problems = find_transition_problems(
+            current, self._registry.accepting_versions(), [view]
+        )
         if problems:
-            raise SchemaError("；".join(problems))
+            raise CompatibilityError("；".join(problems))
 
     # ---------- 生命周期 ----------
 
@@ -77,7 +92,7 @@ class ConsumerManager:
             return c
 
     def upgrade(self, consumer_id: str, new_requirements: Dict[int, FieldType]) -> None:
-        """消费者升级：原子替换其固定的字段视图（按当前可见版本校验）。"""
+        """消费者升级：原子替换其固定的字段视图（按全部接受写入版本校验）。"""
         with self._lock:
             c = self._require(consumer_id)
             if not c.active:
